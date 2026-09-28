@@ -1,0 +1,15 @@
+name: SynergystSvt
+version: 1.0.0
+main: synergyst.svt.plugin.SvtPlugin
+api-version: '1.20'
+author: Synergyst
+description: Server side Skill Verification Token handshake, policy enforcement, and inspection.
+commands:
+  svt:
+    description: Skill Verification Token administration.
+    permission: svt.admin
+    usage: /svt <list|inspect|query|grant|block|unblock|kick|msg|policy|audit>
+permissions:
+  svt.admin:
+    description: Full access to SVT administration commands.
+    default: op

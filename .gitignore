@@ -1,0 +1,40 @@
+# Gradle
+.gradle/
+build/
+out/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+*.launch
+.factorypath
+
+# Eclipse
+bin/
+
+# Fabric
+run/
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Java
+*.class
+*.jar
+*.war
+
+# Misc
+*.bak
+*.tmp
+*.swp
+*~

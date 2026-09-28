@@ -1,0 +1,2578 @@
+main\java\synergyst\svt\plugin\command\SvtCommand.java
+```
+package synergyst.svt.plugin.command;
+
+import org.bukkit.Bukkit;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
+import org.bukkit.entity.Player;
+import synergyst.svt.plugin.SvtPlugin;
+import synergyst.svt.plugin.model.SvtPolicy;
+import synergyst.svt.plugin.model.SvtModule;
+import synergyst.svt.plugin.model.SvtPeer;
+import synergyst.svt.plugin.model.SvtQueryType;
+import synergyst.svt.plugin.protocol.SvtProtocol;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * Administrative command tree for SVT.
+ *
+ * <h2>Subcommands</h2>
+ * <ul>
+ *   <li>{@code list} lists verified peers with version and module counts.</li>
+ *   <li>{@code inspect <player>} shows a peer full manifest summary.</li>
+ *   <li>{@code query <player> <type>} sends an on demand inspection request.</li>
+ *   <li>{@code grant <player> <module>} grants a restricted module.</li>
+ *   <li>{@code block <player>} blocks a peer public key.</li>
+ *   <li>{@code unblock <keyHash>} removes a key from the blocklist.</li>
+ *   <li>{@code kick <player> [reason]} disconnects a player.</li>
+ *   <li>{@code msg <player> <severity> <text>} sends an admin notice.</li>
+ *   <li>{@code policy reload} reloads the policy file.</li>
+ *   <li>{@code audit [n]} prints the last audit lines.</li>
+ * </ul>
+ */
+public final class SvtCommand implements CommandExecutor, TabCompleter {
+
+    private final SvtPlugin plugin;
+
+    public SvtCommand(SvtPlugin plugin) {
+        this.plugin = plugin;
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command,
+                             String label, String[] args) {
+        if (!sender.hasPermission("svt.admin")) {
+            sender.sendMessage("You lack the svt.admin permission.");
+            return true;
+        }
+        if (args.length == 0) {
+            sender.sendMessage("Usage: /svt <list|inspect|query|grant|block|"
+                    + "unblock|kick|msg|policy|audit>");
+            return true;
+        }
+        switch (args[0].toLowerCase()) {
+            case "list" -> doList(sender);
+            case "inspect" -> doInspect(sender, args);
+            case "query" -> doQuery(sender, args);
+            case "grant" -> doGrant(sender, args);
+            case "block" -> doBlock(sender, args);
+            case "unblock" -> doUnblock(sender, args);
+            case "kick" -> doKick(sender, args);
+            case "msg" -> doMsg(sender, args);
+            case "policy" -> doPolicy(sender, args);
+            case "audit" -> doAudit(sender, args);
+            default -> sender.sendMessage("Unknown subcommand: " + args[0]);
+        }
+        return true;
+    }
+
+    private void doList(CommandSender sender) {
+        var peers = plugin.registry().all();
+        sender.sendMessage("SVT verified peers: " + peers.size());
+        for (SvtPeer peer : peers) {
+            int modules = 0;
+            for (long word : peer.moduleBits()) {
+                modules += Long.bitCount(word);
+            }
+            sender.sendMessage("  " + peer.name() + "  v" + peer.modVersion()
+                    + "  fp " + peer.fingerprint() + "  modules " + modules
+                    + (peer.isHandshakeOnly() ? "  [handshake only]" : ""));
+        }
+    }
+
+    private void doInspect(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage("Usage: /svt inspect <player>");
+            return;
+        }
+        Player target = Bukkit.getPlayer(args[1]);
+        if (target == null) {
+            sender.sendMessage("Player not online: " + args[1]);
+            return;
+        }
+        SvtPeer peer = plugin.registry().get(target.getUniqueId());
+        if (peer == null) {
+            sender.sendMessage(args[1] + " is not a verified mod user.");
+            return;
+        }
+        sender.sendMessage("SVT inspect " + peer.name());
+        sender.sendMessage("  version " + peer.modVersion());
+        sender.sendMessage("  fingerprint " + peer.fingerprint());
+        sender.sendMessage("  keyHash " + peer.keyHash());
+        sender.sendMessage("  configHash " + peer.configHash());
+        StringBuilder active = new StringBuilder();
+        for (SvtModule module : SvtModule.values()) {
+            if (module.isSet(peer.moduleBits())) {
+                active.append(module.name()).append(' ');
+            }
+        }
+        sender.sendMessage("  active: " + (active.length() == 0 ? "none" : active));
+    }
+
+    private void doQuery(CommandSender sender, String[] args) {
+        if (args.length < 3) {
+            sender.sendMessage("Usage: /svt query <player> "
+                    + "<MODULE_STATE|CONFIG_HASH|INTEGRITY_HASH|"
+                    + "STATS_SNAPSHOT|COMBAT_SUMMARY>");
+            return;
+        }
+        Player target = Bukkit.getPlayer(args[1]);
+        if (target == null) {
+            sender.sendMessage("Player not online: " + args[1]);
+            return;
+        }
+        SvtQueryType type = SvtQueryType.byName(args[2]);
+        if (type == null) {
+            sender.sendMessage("Unknown query type: " + args[2]);
+            return;
+        }
+        if (sender instanceof Player p) {
+            plugin.listener().registerPendingQuery(target.getUniqueId(), p.getUniqueId());
+        }
+        plugin.messenger().sendQueryRequest(target, type);
+        sender.sendMessage("Query " + type.name() + " sent to " + target.getName());
+    }
+
+    private void doGrant(CommandSender sender, String[] args) {
+        if (args.length < 3) {
+            sender.sendMessage("Usage: /svt grant <player> <module>");
+            return;
+        }
+        Player target = Bukkit.getPlayer(args[1]);
+        if (target == null) {
+            sender.sendMessage("Player not online: " + args[1]);
+            return;
+        }
+        SvtModule module = SvtModule.byName(args[2]);
+        if (module == null) {
+            sender.sendMessage("Unknown module: " + args[2]);
+            return;
+        }
+        plugin.messenger().sendFeatureGrant(target, module, true);
+        sender.sendMessage("Granted " + module.name() + " to " + target.getName());
+    }
+
+    private void doBlock(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage("Usage: /svt block <player>");
+            return;
+        }
+        Player target = Bukkit.getPlayer(args[1]);
+        if (target == null) {
+            sender.sendMessage("Player not online: " + args[1]);
+            return;
+        }
+        SvtPeer peer = plugin.registry().get(target.getUniqueId());
+        if (peer == null) {
+            sender.sendMessage(args[1] + " is not a verified mod user.");
+            return;
+        }
+        if (plugin.blocklist().add(peer.keyHash())) {
+            sender.sendMessage("Blocked key " + peer.fingerprint()
+                    + " (" + target.getName() + ")");
+            target.kickPlayer("Your mod identity has been blocked.");
+        } else {
+            sender.sendMessage("Key already blocked.");
+        }
+    }
+
+    private void doUnblock(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage("Usage: /svt unblock <keyHash>");
+            return;
+        }
+        if (plugin.blocklist().remove(args[1])) {
+            sender.sendMessage("Unblocked " + args[1]);
+        } else {
+            sender.sendMessage("Key not on the blocklist.");
+        }
+    }
+
+    private void doKick(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage("Usage: /svt kick <player> [reason]");
+            return;
+        }
+        Player target = Bukkit.getPlayer(args[1]);
+        if (target == null) {
+            sender.sendMessage("Player not online: " + args[1]);
+            return;
+        }
+        String reason = args.length > 2
+                ? String.join(" ", Arrays.copyOfRange(args, 2, args.length))
+                : "Disconnected by SVT administration.";
+        target.kickPlayer(reason);
+        sender.sendMessage("Kicked " + target.getName());
+    }
+
+    private void doMsg(CommandSender sender, String[] args) {
+        if (args.length < 4) {
+            sender.sendMessage("Usage: /svt msg <player> <info|warn|error> <text>");
+            return;
+        }
+        Player target = Bukkit.getPlayer(args[1]);
+        if (target == null) {
+            sender.sendMessage("Player not online: " + args[1]);
+            return;
+        }
+        if (!plugin.registry().contains(target.getUniqueId())) {
+            sender.sendMessage(args[1] + " is not a verified mod user.");
+            return;
+        }
+        byte severity = switch (args[2].toLowerCase()) {
+            case "warn"  -> SvtProtocol.SEVERITY_WARN;
+            case "error" -> SvtProtocol.SEVERITY_ERROR;
+            default      -> SvtProtocol.SEVERITY_INFO;
+        };
+        String text = String.join(" ", Arrays.copyOfRange(args, 3, args.length));
+        plugin.messenger().sendAdminMessage(target, severity, text);
+        sender.sendMessage("Sent notice to " + target.getName());
+    }
+
+    private void doPolicy(CommandSender sender, String[] args) {
+        if (args.length < 2 || !args[1].equalsIgnoreCase("reload")) {
+            sender.sendMessage("Usage: /svt policy reload");
+            return;
+        }
+        plugin.policyStore().load();
+        plugin.blocklist().load();
+        SvtPolicy policy = plugin.policyStore().policy();
+        for (Player online : Bukkit.getOnlinePlayers()) {
+            if (plugin.registry().contains(online.getUniqueId())) {
+                plugin.messenger().sendPolicy(online, policy);
+            }
+        }
+        sender.sendMessage("Reloaded policy v" + policy.policyVersion()
+                + " and pushed to verified peers.");
+    }
+
+    private void doAudit(CommandSender sender, String[] args) {
+        int n = 10;
+        if (args.length > 1) {
+            try {
+                n = Math.max(1, Math.min(100, Integer.parseInt(args[1])));
+            } catch (NumberFormatException ignored) {
+                // keep default
+            }
+        }
+        List<String> lines = plugin.audit().tail(n);
+        sender.sendMessage("SVT audit (last " + lines.size() + "):");
+        for (String line : lines) {
+            sender.sendMessage("  " + line);
+        }
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command command,
+                                      String alias, String[] args) {
+        List<String> out = new ArrayList<>();
+        if (args.length == 1) {
+            out.addAll(Arrays.asList("list", "inspect", "query", "grant",
+                    "block", "unblock", "kick", "msg", "policy", "audit"));
+        } else if (args.length == 2) {
+            String sub = args[0].toLowerCase();
+            if (sub.equals("inspect") || sub.equals("query") || sub.equals("grant")
+                    || sub.equals("block") || sub.equals("kick") || sub.equals("msg")) {
+                for (Player p : Bukkit.getOnlinePlayers()) {
+                    out.add(p.getName());
+                }
+            } else if (sub.equals("policy")) {
+                out.add("reload");
+            }
+        } else if (args.length == 3) {
+            String sub = args[0].toLowerCase();
+            if (sub.equals("query")) {
+                for (SvtQueryType type : SvtQueryType.values()) {
+                    out.add(type.name());
+                }
+            } else if (sub.equals("grant")) {
+                for (SvtModule module : SvtModule.values()) {
+                    out.add(module.name());
+                }
+            } else if (sub.equals("msg")) {
+                out.addAll(Arrays.asList("info", "warn", "error"));
+            }
+        }
+        return out;
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\crypto\SvtCrypto.java
+```
+package synergyst.svt.plugin.crypto;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
+import java.security.MessageDigest;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.spec.X509EncodedKeySpec;
+
+/**
+ * Cryptographic helpers for handshake verification.
+ *
+ * <p>All public methods treat their byte array inputs as hostile. Key
+ * parsing and signature verification are wrapped so that malformed
+ * input produces a negative result rather than propagating an
+ * exception into the packet handler.</p>
+ */
+public final class SvtCrypto {
+
+    private static final String ALGORITHM = "Ed25519";
+
+    private SvtCrypto() {
+        throw new AssertionError("Utility class");
+    }
+
+    /**
+     * Verifies an Ed25519 signature over the given data using an X.509
+     * encoded public key.
+     *
+     * @param publicKeyX509 the encoded public key bytes
+     * @param data          the signed data
+     * @param signature     the signature to verify
+     * @return whether the signature is valid, false on any failure
+     */
+    public static boolean verify(byte[] publicKeyX509, byte[] data, byte[] signature) {
+        try {
+            KeyFactory kf = KeyFactory.getInstance(ALGORITHM);
+            PublicKey pub = kf.generatePublic(new X509EncodedKeySpec(publicKeyX509));
+            Signature sig = Signature.getInstance(ALGORITHM);
+            sig.initVerify(pub);
+            sig.update(data);
+            return sig.verify(signature);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Recomputes the manifest hash from the module bit set and the mod
+     * version using the client canonical layout.
+     *
+     * <p>The layout is each bit set word as eight big endian bytes,
+     * followed by the UTF-8 bytes of the mod version. The result is the
+     * raw SHA-256 digest.</p>
+     *
+     * @param bits       the module bit set
+     * @param modVersion the mod version string
+     * @return the digest bytes, or null on failure
+     */
+    public static byte[] manifestHash(long[] bits, String modVersion) {
+        try {
+            byte[] versionBytes = modVersion.getBytes(StandardCharsets.UTF_8);
+            ByteBuffer buffer = ByteBuffer.allocate(bits.length * 8 + versionBytes.length);
+            for (long word : bits) {
+                buffer.putLong(word);
+            }
+            buffer.put(versionBytes);
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return digest.digest(buffer.array());
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Returns the lower case hexadecimal encoding of a byte array.
+     *
+     * @param bytes the bytes
+     * @return the hex string
+     */
+    public static String toHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+            sb.append(Character.forDigit(b & 0xF, 16));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Computes the full SHA-256 hash of a public key, used as the
+     * blocklist key identifier.
+     *
+     * @param publicKeyX509 the encoded public key
+     * @return the 64 character hex hash, or null on failure
+     */
+    public static String keyHash(byte[] publicKeyX509) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return toHex(digest.digest(publicKeyX509));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Returns a short display fingerprint, the first eight characters
+     * of the key hash.
+     *
+     * @param keyHash the full key hash
+     * @return the fingerprint, or the string unknown if the hash is null
+     */
+    public static String fingerprint(String keyHash) {
+        if (keyHash == null || keyHash.length() < 8) {
+            return "unknown";
+        }
+        return keyHash.substring(0, 8);
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\crypto\SvtVersion.java
+```
+package synergyst.svt.plugin.crypto;
+
+/**
+ * Lenient mod version comparison for the version gate.
+ *
+ * <p>Version strings are compared by their numeric components. A
+ * leading letter such as the {@code v} prefix is ignored, and trailing
+ * non numeric qualifiers such as a release candidate suffix are not
+ * considered. The comparison walks numeric groups left to right. A
+ * missing group is treated as zero.</p>
+ */
+public final class SvtVersion {
+
+    private SvtVersion() {
+        throw new AssertionError("Utility class");
+    }
+
+    /**
+     * Tests whether a client version satisfies a minimum requirement.
+     *
+     * @param client the client mod version
+     * @param minimum the required minimum version
+     * @return whether the client version is greater than or equal to
+     *         the minimum
+     */
+    public static boolean satisfies(String client, String minimum) {
+        if (minimum == null || minimum.isBlank()) {
+            return true;
+        }
+        int[] c = parse(client);
+        int[] m = parse(minimum);
+        int len = Math.max(c.length, m.length);
+        for (int i = 0; i < len; i++) {
+            int cv = i < c.length ? c[i] : 0;
+            int mv = i < m.length ? m[i] : 0;
+            if (cv != mv) {
+                return cv > mv;
+            }
+        }
+        return true;
+    }
+
+    private static int[] parse(String version) {
+        if (version == null) {
+            return new int[0];
+        }
+        String[] parts = version.replaceAll("[^0-9.]", " ").trim().split("[.\\s]+");
+        int[] out = new int[parts.length];
+        int count = 0;
+        for (String part : parts) {
+            if (part.isEmpty()) {
+                continue;
+            }
+            try {
+                out[count++] = Integer.parseInt(part);
+            } catch (NumberFormatException ignored) {
+                // skip non numeric groups
+            }
+        }
+        int[] trimmed = new int[count];
+        System.arraycopy(out, 0, trimmed, 0, count);
+        return trimmed;
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\model\SvtModule.java
+```
+package synergyst.svt.plugin.model;
+
+/**
+ * Server side mirror of the client module enumeration.
+ *
+ * <p>The ordinal order defines the bit position of each module in a
+ * manifest bit set and in policy and query encodings. This order must
+ * match the client enumeration exactly. Constants may be appended at
+ * the end when the client appends them. Reordering or removing
+ * constants changes the meaning of existing bit positions and requires
+ * a protocol version bump on both sides.</p>
+ */
+public enum SvtModule {
+
+    FAST_ATTACK_PLACE("Fast Attack / Place"),
+    ANTI_SHUFFLE("Anti-Shuffle"),
+    NO_SWING_ANIMATION("No Crystal Swing"),
+    ANCHOR_ANTI_AIRPLACE("Anchor Anti-Airplace"),
+    ANCHOR_GHOST_FIX("Anchor Ghost Block Fix"),
+    CUSTOM_BLOCK_OUTLINE("Custom Block Outline"),
+    PACKET_OPTIMIZATION("Packet Optimization"),
+    PACKET_PRIORITIZATION("Packet Prioritization"),
+    ADAPTIVE_SEND_RATE("Adaptive Send Rate"),
+    INVENTORY_RESYNC("Inventory Resync"),
+    COMBAT_ANALYTICS("Combat Analytics"),
+    COMBAT_DEBUG_OVERLAY("Combat Debug Overlay"),
+    AI_ANALYSIS("AI Analysis"),
+    CRYSTAL_VISUAL_LOD("Crystal Visual LOD"),
+    EXPLOSION_PARTICLE_THROTTLE("Explosion Particle Throttle"),
+    NO_CAMERA_SHAKE("No Damage Camera Tilt"),
+    COMBAT_FOV_LOCK("Combat FOV Lock"),
+    BOT_TRAINING("Bot Training");
+
+    private static final SvtModule[] VALUES = values();
+
+    private final String displayName;
+
+    SvtModule(String displayName) {
+        this.displayName = displayName;
+    }
+
+    /**
+     * Returns the human readable label.
+     *
+     * @return the display name
+     */
+    public String displayName() {
+        return displayName;
+    }
+
+    /**
+     * Resolves a module by ordinal, validating the index.
+     *
+     * @param ordinal the ordinal
+     * @return the module, or null if out of range
+     */
+    public static SvtModule byOrdinal(int ordinal) {
+        if (ordinal < 0 || ordinal >= VALUES.length) {
+            return null;
+        }
+        return VALUES[ordinal];
+    }
+
+    /**
+     * Resolves a module by its enum name, case insensitive.
+     *
+     * @param name the enum constant name
+     * @return the module, or null if not found
+     */
+    public static SvtModule byName(String name) {
+        if (name == null) {
+            return null;
+        }
+        try {
+            return valueOf(name.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Tests whether a bit set marks this module active.
+     *
+     * @param bits the bit set
+     * @return whether the module bit is set
+     */
+    public boolean isSet(long[] bits) {
+        int word = ordinal() >> 6;
+        if (word >= bits.length) {
+            return false;
+        }
+        return (bits[word] & (1L << (ordinal() & 63))) != 0;
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\model\SvtPeer.java
+```
+package synergyst.svt.plugin.model;
+
+import synergyst.svt.plugin.crypto.SvtCrypto;
+import synergyst.svt.plugin.protocol.SvtProtocol;
+
+import java.util.UUID;
+
+/**
+ * State of a verified mod user held in memory for the duration of a
+ * connection.
+ *
+ * @param uuid           the account UUID
+ * @param name           the account name
+ * @param modVersion     the reported mod version
+ * @param capabilities   the capability bit field
+ * @param moduleBits     the module manifest bit set
+ * @param configHash     the reported config hash
+ * @param keyHash        the full public key hash
+ * @param handshakeAtMs  the time the handshake was verified
+ */
+public record SvtPeer(UUID uuid, String name, String modVersion,
+                      byte capabilities, long[] moduleBits, String configHash,
+                      String keyHash, long handshakeAtMs) {
+
+    /**
+     * Returns whether the peer requested handshake only visibility.
+     *
+     * @return whether the handshake only capability bit is set
+     */
+    public boolean isHandshakeOnly() {
+        return (capabilities & SvtProtocol.CAP_HANDSHAKE_ONLY) != 0;
+    }
+
+    /**
+     * Returns the short key fingerprint.
+     *
+     * @return the fingerprint
+     */
+    public String fingerprint() {
+        return SvtCrypto.fingerprint(keyHash);
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\model\SvtPolicy.java
+```
+package synergyst.svt.plugin.model;
+
+import synergyst.svt.plugin.store.SvtPolicyStore;
+
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * An immutable server policy loaded from the plugin configuration.
+ *
+ * <p>A policy declares the minimum acceptable mod version, a set of
+ * module enforcement rules, and the configuration hash whitelist
+ * options. It is constructed by {@link SvtPolicyStore} from a JSON file
+ * that only a server operator can edit. No part of a policy originates
+ * from the network.</p>
+ */
+public final class SvtPolicy {
+
+    private final int policyVersion;
+    private final String minModVersion;
+    private final Map<SvtModule, SvtPolicyRule> rules;
+    private final boolean requireConfigWhitelist;
+    private final Set<String> approvedConfigHashes;
+
+    /**
+     * Constructs a policy.
+     *
+     * @param policyVersion          the policy version reported to clients
+     * @param minModVersion          the minimum acceptable mod version
+     * @param rules                  the module rules
+     * @param requireConfigWhitelist whether a client config hash must be
+     *                               on the approved list
+     * @param approvedConfigHashes   the approved config hashes
+     */
+    public SvtPolicy(int policyVersion, String minModVersion,
+                     Map<SvtModule, SvtPolicyRule> rules,
+                     boolean requireConfigWhitelist,
+                     Set<String> approvedConfigHashes) {
+        this.policyVersion = policyVersion;
+        this.minModVersion = minModVersion;
+        this.rules = Collections.unmodifiableMap(new EnumMap<>(rules));
+        this.requireConfigWhitelist = requireConfigWhitelist;
+        this.approvedConfigHashes = Set.copyOf(approvedConfigHashes);
+    }
+
+    /**
+     * Returns the policy version.
+     *
+     * @return the policy version
+     */
+    public int policyVersion() {
+        return policyVersion;
+    }
+
+    /**
+     * Returns the minimum acceptable mod version, possibly empty.
+     *
+     * @return the minimum mod version
+     */
+    public String minModVersion() {
+        return minModVersion;
+    }
+
+    /**
+     * Returns the rule for a module, or null if unmentioned.
+     *
+     * @param module the module
+     * @return the rule, or null
+     */
+    public SvtPolicyRule ruleFor(SvtModule module) {
+        return rules.get(module);
+    }
+
+    /**
+     * Returns all rules.
+     *
+     * @return an unmodifiable list of rules
+     */
+    public List<SvtPolicyRule> rules() {
+        return List.copyOf(rules.values());
+    }
+
+    /**
+     * Returns whether config hash whitelisting is enabled.
+     *
+     * @return the whitelist requirement flag
+     */
+    public boolean requireConfigWhitelist() {
+        return requireConfigWhitelist;
+    }
+
+    /**
+     * Tests whether a config hash is approved.
+     *
+     * @param hash the client config hash
+     * @return whether the hash is on the approved list
+     */
+    public boolean isConfigApproved(String hash) {
+        return approvedConfigHashes.contains(hash);
+    }
+
+    /**
+     * Returns the number of rules that actively change a module state.
+     *
+     * @return the enforcing rule count
+     */
+    public int enforcingCount() {
+        int count = 0;
+        for (SvtPolicyRule rule : rules.values()) {
+            if (rule.isEnforcing()) {
+                count++;
+            }
+        }
+        return count;
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\model\SvtPolicyMode.java
+```
+package synergyst.svt.plugin.model;
+
+/**
+ * Server side mirror of the client policy mode enumeration.
+ *
+ * <p>Ordinal order must match the client. A mode travels as its
+ * ordinal in a single byte within a policy manifest.</p>
+ */
+public enum SvtPolicyMode {
+
+    /** Leave the module state unchanged. */
+    ALLOW,
+
+    /** Force the module off. */
+    FORBID,
+
+    /** Force the module on. */
+    REQUIRE,
+
+    /** Force the module off unless explicitly granted. */
+    GRANT_ONLY;
+
+    /**
+     * Resolves a mode by its enum name, case insensitive.
+     *
+     * @param name the enum constant name
+     * @return the mode, or null if not found
+     */
+    public static SvtPolicyMode byName(String name) {
+        if (name == null) {
+            return null;
+        }
+        try {
+            return valueOf(name.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Returns the boolean state this mode forces on a compliant client,
+     * or null when the mode leaves the state unchanged.
+     *
+     * @return the forced state, or null
+     */
+    public Boolean forcedState() {
+        return switch (this) {
+            case FORBID, GRANT_ONLY -> Boolean.FALSE;
+            case REQUIRE            -> Boolean.TRUE;
+            case ALLOW              -> null;
+        };
+    }
+
+    /**
+     * Returns whether this mode actively changes the module state.
+     *
+     * @return whether the mode is anything other than {@link #ALLOW}
+     */
+    public boolean isEnforcing() {
+        return this != ALLOW;
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\model\SvtPolicyRule.java
+```
+package synergyst.svt.plugin.model;
+
+/**
+ * A single module enforcement rule within a server policy.
+ *
+ * @param module    the governed module
+ * @param mode      the enforcement disposition
+ * @param mandatory whether a client failure to satisfy the rule is
+ *                  grounds to disconnect the client
+ */
+public record SvtPolicyRule(SvtModule module, SvtPolicyMode mode, boolean mandatory) {
+
+    /**
+     * Returns the boolean state this rule forces, or null when it
+     * leaves the module unchanged.
+     *
+     * @return the forced state, or null
+     */
+    public Boolean forcedState() {
+        return mode.forcedState();
+    }
+
+    /**
+     * Returns whether this rule actively changes the module state.
+     *
+     * @return whether the mode enforces
+     */
+    public boolean isEnforcing() {
+        return mode.isEnforcing();
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\model\SvtQueryType.java
+```
+package synergyst.svt.plugin.model;
+
+/**
+ * Server side mirror of the client query type enumeration.
+ *
+ * <p>Ordinal order must match the client. A query type travels as its
+ * ordinal in a var int.</p>
+ */
+public enum SvtQueryType {
+
+    MODULE_STATE,
+    CONFIG_HASH,
+    INTEGRITY_HASH,
+    STATS_SNAPSHOT,
+    COMBAT_SUMMARY;
+
+    /**
+     * Resolves a query type by its enum name, case insensitive.
+     *
+     * @param name the enum constant name
+     * @return the type, or null if not found
+     */
+    public static SvtQueryType byName(String name) {
+        if (name == null) {
+            return null;
+        }
+        try {
+            return valueOf(name.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\net\SvtChallengeManager.java
+```
+package synergyst.svt.plugin.net;
+
+import synergyst.svt.plugin.protocol.SvtProtocol;
+
+import java.security.SecureRandom;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Issues and tracks per connection handshake nonces.
+ *
+ * <p>A nonce is generated when a client sends its presence
+ * announcement. The handshake signature must cover this nonce, which
+ * ties the signature to the current connection and prevents replay of a
+ * captured handshake. A nonce expires after a short window and is
+ * consumed when the matching handshake is verified.</p>
+ */
+public final class SvtChallengeManager {
+
+    private static final long EXPIRY_MS = 30_000L;
+
+    private final SecureRandom random = new SecureRandom();
+    private final Map<UUID, Entry> pending = new ConcurrentHashMap<>();
+
+    private record Entry(byte[] nonce, long issuedAtMs) {}
+
+    /**
+     * Generates and stores a fresh nonce for a player.
+     *
+     * @param uuid the account UUID
+     * @return the generated nonce bytes
+     */
+    public byte[] issue(UUID uuid) {
+        byte[] nonce = new byte[SvtProtocol.CHALLENGE_NONCE_LEN];
+        random.nextBytes(nonce);
+        pending.put(uuid, new Entry(nonce, System.currentTimeMillis()));
+        return nonce;
+    }
+
+    /**
+     * Consumes and returns the pending nonce for a player if it exists
+     * and has not expired.
+     *
+     * @param uuid the account UUID
+     * @return the nonce bytes, or null if absent or expired
+     */
+    public byte[] consume(UUID uuid) {
+        Entry entry = pending.remove(uuid);
+        if (entry == null) {
+            return null;
+        }
+        if (System.currentTimeMillis() - entry.issuedAtMs() > EXPIRY_MS) {
+            return null;
+        }
+        return entry.nonce();
+    }
+
+    /**
+     * Drops any pending nonce for a player.
+     *
+     * @param uuid the account UUID
+     */
+    public void clear(UUID uuid) {
+        pending.remove(uuid);
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\net\SvtChannelListener.java
+```
+package synergyst.svt.plugin.net;
+
+import org.bukkit.Bukkit;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.messaging.PluginMessageListener;
+import synergyst.svt.plugin.SvtPlugin;
+import synergyst.svt.plugin.model.SvtPolicy;
+import synergyst.svt.plugin.store.SvtPolicyStore;
+import synergyst.svt.plugin.crypto.SvtCrypto;
+import synergyst.svt.plugin.crypto.SvtVersion;
+import synergyst.svt.plugin.model.SvtModule;
+import synergyst.svt.plugin.model.SvtPeer;
+import synergyst.svt.plugin.model.SvtPolicyRule;
+import synergyst.svt.plugin.model.SvtQueryType;
+import synergyst.svt.plugin.protocol.SvtByteBuf;
+import synergyst.svt.plugin.protocol.SvtProtocol;
+import synergyst.svt.plugin.store.SvtAuditLog;
+import synergyst.svt.plugin.store.SvtBlocklist;
+
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
+
+/**
+ * Receives and processes inbound SVT packets from clients.
+ *
+ * <h2>Hostile input</h2>
+ * The byte array delivered by Bukkit originates from a client and is
+ * treated as hostile. Decoding is performed with {@link SvtByteBuf},
+ * which enforces length limits and bounds checks. Any decode failure is
+ * caught, logged, and results in a malformed rejection rather than a
+ * propagated exception.
+ *
+ * <h2>Handshake pipeline</h2>
+ * A HELLO triggers a challenge. A HANDSHAKE is verified through the
+ * version gate, hash binding, config whitelist, blocklist, and
+ * signature check before the peer is registered and the policy is sent.
+ * A POLICY_ACK is checked against mandatory rules. A QUERY_RESPONSE is
+ * routed to the administrator who requested it.
+ */
+public final class SvtChannelListener implements PluginMessageListener {
+
+    private final SvtPlugin plugin;
+    private final Logger logger;
+    private final SvtMessenger messenger;
+    private final SvtPeerRegistry registry;
+    private final SvtChallengeManager challenges;
+    private final SvtPolicyStore policyStore;
+    private final SvtBlocklist blocklist;
+    private final SvtAuditLog audit;
+
+    /**
+     * Pending query requesters keyed by target player UUID. Maps to the
+     * administrator awaiting the response.
+     */
+    private final Map<UUID, UUID> pendingQueries = new ConcurrentHashMap<>();
+
+    public SvtChannelListener(SvtPlugin plugin) {
+        this.plugin = plugin;
+        this.logger = plugin.getLogger();
+        this.messenger = plugin.messenger();
+        this.registry = plugin.registry();
+        this.challenges = plugin.challenges();
+        this.policyStore = plugin.policyStore();
+        this.blocklist = plugin.blocklist();
+        this.audit = plugin.audit();
+    }
+
+    /**
+     * Registers a pending query so the response can be routed back to
+     * the requesting administrator.
+     *
+     * @param target    the inspected player UUID
+     * @param requester the administrator UUID
+     */
+    public void registerPendingQuery(UUID target, UUID requester) {
+        pendingQueries.put(target, requester);
+    }
+
+    @Override
+    public void onPluginMessageReceived(String channel, Player player, byte[] message) {
+        if (!SvtProtocol.CHANNEL.equals(channel)) {
+            return;
+        }
+        try {
+            SvtByteBuf buf = SvtByteBuf.reader(message);
+            byte packetId = buf.readByte();
+            switch (packetId) {
+                case SvtProtocol.C2S_HELLO -> handleHello(player, buf);
+                case SvtProtocol.C2S_HANDSHAKE -> handleHandshake(player, buf);
+                case SvtProtocol.C2S_POLICY_ACK -> handlePolicyAck(player, buf);
+                case SvtProtocol.C2S_QUERY_RESPONSE -> handleQueryResponse(player, buf);
+                default -> logger.warning("Unknown SVT packet id " + packetId
+                        + " from " + player.getName());
+            }
+        } catch (SvtByteBuf.SvtDecodeException e) {
+            logger.warning("Malformed SVT packet from " + player.getName()
+                    + ": " + e.getMessage());
+            messenger.sendReject(player, SvtProtocol.REJECT_MALFORMED, "decode error");
+        } catch (Exception e) {
+            logger.warning("Error handling SVT packet from " + player.getName()
+                    + ": " + e.getMessage());
+        }
+    }
+
+    /* ═══════════════════ HELLO ═══════════════════ */
+
+    private void handleHello(Player player, SvtByteBuf buf) {
+        int protocolVersion = buf.readVarInt();
+        String modVersion = buf.readString(SvtProtocol.MAX_VERSION_LEN);
+        buf.readByte(); // capabilities, re-read authoritatively from handshake
+
+        SvtPolicy policy = policyStore.policy();
+        if (!SvtVersion.satisfies(modVersion, policy.minModVersion())) {
+            messenger.sendReject(player, SvtProtocol.REJECT_OUTDATED,
+                    "requires " + policy.minModVersion());
+            audit.record(player.getUniqueId().toString(), player.getName(),
+                    "n/a", modVersion, protocolVersion, 0, "n/a",
+                    "REJECT_OUTDATED_ON_HELLO");
+            return;
+        }
+
+        byte[] nonce = challenges.issue(player.getUniqueId());
+        messenger.sendChallenge(player, nonce);
+        logger.info("SVT HELLO from " + player.getName()
+                + " protocol " + protocolVersion + " version " + modVersion);
+    }
+
+    /* ═══════════════════ HANDSHAKE ═══════════════════ */
+
+    private void handleHandshake(Player player, SvtByteBuf buf) {
+        String modVersion = buf.readString(SvtProtocol.MAX_VERSION_LEN);
+        byte capabilities = buf.readByte();
+        byte[] pubKey = buf.readByteArray(SvtProtocol.MAX_PUBLIC_KEY_LEN);
+        long[] moduleBits = buf.readLongArray(SvtProtocol.MAX_MANIFEST_WORDS);
+        String configHash = buf.readString(SvtProtocol.MAX_CONFIG_HASH_LEN);
+        byte[] signature = buf.readByteArray(SvtProtocol.MAX_SIGNATURE_LEN);
+
+        UUID uuid = player.getUniqueId();
+        String name = player.getName();
+        SvtPolicy policy = policyStore.policy();
+
+        String keyHash = SvtCrypto.keyHash(pubKey);
+        String fingerprint = SvtCrypto.fingerprint(keyHash);
+        int moduleCount = SvtModule.byOrdinal(0) == null ? 0 : countBits(moduleBits);
+
+        byte[] nonce = challenges.consume(uuid);
+        if (nonce == null) {
+            reject(player, SvtProtocol.REJECT_MALFORMED, "no active challenge",
+                    name, modVersion, moduleCount, configHash);
+            return;
+        }
+
+        if (!SvtVersion.satisfies(modVersion, policy.minModVersion())) {
+            reject(player, SvtProtocol.REJECT_OUTDATED,
+                    "requires " + policy.minModVersion(),
+                    name, modVersion, moduleCount, configHash);
+            return;
+        }
+
+        if (blocklist.isBlocked(keyHash)) {
+            reject(player, SvtProtocol.REJECT_BLOCKED, "identity revoked",
+                    name, modVersion, moduleCount, configHash);
+            kickMandatory(player, "Your mod identity is blocked on this server.");
+            return;
+        }
+
+        byte[] rawHash = SvtCrypto.manifestHash(moduleBits, modVersion);
+        if (rawHash == null || !SvtCrypto.toHex(rawHash).equals(configHash)) {
+            reject(player, SvtProtocol.REJECT_MALFORMED, "hash binding failed",
+                    name, modVersion, moduleCount, configHash);
+            return;
+        }
+
+        if (policy.requireConfigWhitelist() && !policy.isConfigApproved(configHash)) {
+            reject(player, SvtProtocol.REJECT_POLICY, "config not approved",
+                    name, modVersion, moduleCount, configHash);
+            return;
+        }
+
+        byte[] signedPayload = concat(nonce, rawHash);
+        if (!SvtCrypto.verify(pubKey, signedPayload, signature)) {
+            reject(player, SvtProtocol.REJECT_SIGNATURE, "invalid signature",
+                    name, modVersion, moduleCount, configHash);
+            return;
+        }
+
+        SvtPeer peer = new SvtPeer(uuid, name, modVersion, capabilities,
+                moduleBits, configHash, keyHash, System.currentTimeMillis());
+        registry.put(peer);
+
+        messenger.sendPolicy(player, policy);
+        broadcastPresence(peer);
+
+        audit.record(uuid.toString(), name, fingerprint, modVersion,
+                SvtProtocol.VERSION, moduleCount, configHash, "VERIFIED");
+        logger.info("SVT verified " + name + " fingerprint " + fingerprint
+                + " modules " + moduleCount);
+    }
+
+    private void reject(Player player, byte reason, String message,
+                        String name, String modVersion, int moduleCount,
+                        String configHash) {
+        messenger.sendReject(player, reason, message);
+        audit.record(player.getUniqueId().toString(), name, "n/a", modVersion,
+                SvtProtocol.VERSION, moduleCount, configHash,
+                "REJECT_" + SvtProtocol.rejectReasonName(reason));
+        logger.info("SVT rejected " + name + ": "
+                + SvtProtocol.rejectReasonName(reason) + " " + message);
+    }
+
+    private void kickMandatory(Player player, String reason) {
+        Bukkit.getScheduler().runTask(plugin,
+                () -> player.kickPlayer(reason));
+    }
+
+    /* ═══════════════════ POLICY_ACK ═══════════════════ */
+
+    private void handlePolicyAck(Player player, SvtByteBuf buf) {
+        int policyVersion = buf.readVarInt();
+        long[] activeBits = buf.readLongArray(SvtProtocol.MAX_MANIFEST_WORDS);
+
+        SvtPolicy policy = policyStore.policy();
+        SvtModule violated = null;
+
+        for (SvtPolicyRule rule : policy.rules()) {
+            if (!rule.mandatory() || !rule.isEnforcing()) {
+                continue;
+            }
+            Boolean required = rule.forcedState();
+            if (required == null) {
+                continue;
+            }
+            boolean actual = rule.module().isSet(activeBits);
+            if (actual != required) {
+                violated = rule.module();
+                break;
+            }
+        }
+
+        if (violated != null) {
+            logger.warning("SVT mandatory violation by " + player.getName()
+                    + " on module " + violated.name());
+            audit.record(player.getUniqueId().toString(), player.getName(),
+                    "n/a", "n/a", SvtProtocol.VERSION, 0, "n/a",
+                    "KICK_MANDATORY_" + violated.name());
+            kickMandatory(player,
+                    "A required setting could not be enforced: " + violated.displayName());
+        } else {
+            logger.info("SVT policy ack from " + player.getName()
+                    + " policy v" + policyVersion + " compliant");
+        }
+    }
+
+    /* ═══════════════════ QUERY_RESPONSE ═══════════════════ */
+
+    private void handleQueryResponse(Player player, SvtByteBuf buf) {
+        int typeOrdinal = buf.readVarInt();
+        byte status = buf.readByte();
+
+        SvtQueryType type = typeOrdinal >= 0
+                && typeOrdinal < SvtQueryType.values().length
+                ? SvtQueryType.values()[typeOrdinal] : null;
+
+        StringBuilder result = new StringBuilder();
+        result.append("Query ").append(type == null ? typeOrdinal : type.name())
+                .append(" from ").append(player.getName()).append(": ");
+
+        if (status == SvtProtocol.QUERY_DENIED) {
+            result.append("denied by user");
+        } else if (status == SvtProtocol.QUERY_UNSUPPORTED) {
+            result.append("unsupported");
+        } else if (type == null) {
+            result.append("unknown type");
+        } else {
+            appendPayload(result, type, buf);
+        }
+
+        UUID requester = pendingQueries.remove(player.getUniqueId());
+        String text = result.toString();
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            CommandSender target = requester != null
+                    ? Bukkit.getPlayer(requester) : null;
+            if (target != null) {
+                target.sendMessage("[SVT] " + text);
+            } else {
+                Bukkit.getConsoleSender().sendMessage("[SVT] " + text);
+            }
+        });
+        logger.info("[SVT] " + text);
+    }
+
+    private void appendPayload(StringBuilder out, SvtQueryType type, SvtByteBuf buf) {
+        switch (type) {
+            case MODULE_STATE -> {
+                long[] bits = buf.readLongArray(SvtProtocol.MAX_MANIFEST_WORDS);
+                out.append("active modules ").append(countBits(bits));
+            }
+            case CONFIG_HASH -> out.append("config hash ")
+                    .append(buf.readString(SvtProtocol.MAX_QUERY_STRING_LEN));
+            case INTEGRITY_HASH -> out.append("integrity ")
+                    .append(buf.readString(SvtProtocol.MAX_QUERY_STRING_LEN));
+            case STATS_SNAPSHOT -> {
+                int sessions = buf.readVarInt();
+                int deaths = buf.readVarInt();
+                int survived = buf.readVarInt();
+                int crystals = buf.readVarInt();
+                out.append("sessions ").append(sessions)
+                        .append(" deaths ").append(deaths)
+                        .append(" survived ").append(survived)
+                        .append(" crystals ").append(crystals);
+            }
+            case COMBAT_SUMMARY -> {
+                String fightId = buf.readString(SvtProtocol.MAX_QUERY_STRING_LEN);
+                int duration = buf.readVarInt();
+                int crystals = buf.readVarInt();
+                int kills = buf.readVarInt();
+                boolean died = buf.readByte() != 0;
+                out.append("fight ").append(fightId)
+                        .append(" duration ").append(duration)
+                        .append(" crystals ").append(crystals)
+                        .append(" kills ").append(kills)
+                        .append(" died ").append(died);
+            }
+        }
+    }
+
+    /* ═══════════════════ Presence broadcast ═══════════════════ */
+
+    private void broadcastPresence(SvtPeer arriving) {
+        Player arrivingPlayer = Bukkit.getPlayer(arriving.uuid());
+        for (SvtPeer other : registry.all()) {
+            if (other.uuid().equals(arriving.uuid())) {
+                continue;
+            }
+            if (!other.isHandshakeOnly() && arrivingPlayer != null) {
+                messenger.sendPeerPresent(arrivingPlayer, other);
+            }
+            if (!arriving.isHandshakeOnly()) {
+                Player otherPlayer = Bukkit.getPlayer(other.uuid());
+                if (otherPlayer != null) {
+                    messenger.sendPeerPresent(otherPlayer, arriving);
+                }
+            }
+        }
+    }
+
+    /* ═══════════════════ Helpers ═══════════════════ */
+
+    private static int countBits(long[] bits) {
+        int count = 0;
+        for (long word : bits) {
+            count += Long.bitCount(word);
+        }
+        return count;
+    }
+
+    private static byte[] concat(byte[] a, byte[] b) {
+        byte[] out = new byte[a.length + b.length];
+        System.arraycopy(a, 0, out, 0, a.length);
+        System.arraycopy(b, 0, out, a.length, b.length);
+        return out;
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\net\SvtMessenger.java
+```
+package synergyst.svt.plugin.net;
+
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.Plugin;
+import synergyst.svt.plugin.model.SvtPolicy;
+import synergyst.svt.plugin.model.SvtModule;
+import synergyst.svt.plugin.model.SvtPeer;
+import synergyst.svt.plugin.model.SvtPolicyRule;
+import synergyst.svt.plugin.model.SvtQueryType;
+import synergyst.svt.plugin.protocol.SvtByteBuf;
+import synergyst.svt.plugin.protocol.SvtProtocol;
+
+import java.util.UUID;
+
+/**
+ * Builds and sends server to client SVT packets.
+ *
+ * <p>All packets are constructed with {@link SvtByteBuf} in the
+ * Minecraft wire format the client expects and delivered through the
+ * Bukkit plugin messaging system.</p>
+ */
+public final class SvtMessenger {
+
+    private final Plugin plugin;
+
+    /**
+     * Creates a messenger bound to the owning plugin.
+     *
+     * @param plugin the plugin instance
+     */
+    public SvtMessenger(Plugin plugin) {
+        this.plugin = plugin;
+    }
+
+    private void send(Player player, byte[] payload) {
+        player.sendPluginMessage(plugin, SvtProtocol.CHANNEL, payload);
+    }
+
+    /**
+     * Sends a challenge nonce to a player.
+     *
+     * @param player the target player
+     * @param nonce  the nonce bytes
+     */
+    public void sendChallenge(Player player, byte[] nonce) {
+        byte[] payload = SvtByteBuf.writer()
+                .writeByte(SvtProtocol.S2C_SERVER_CHALLENGE)
+                .writeByteArray(nonce)
+                .writeVarInt(SvtProtocol.VERSION)
+                .toBytes();
+        send(player, payload);
+    }
+
+    /**
+     * Sends a handshake rejection.
+     *
+     * @param player  the target player
+     * @param reason  the reason code
+     * @param message a short explanatory message
+     */
+    public void sendReject(Player player, byte reason, String message) {
+        byte[] payload = SvtByteBuf.writer()
+                .writeByte(SvtProtocol.S2C_PROTOCOL_REJECT)
+                .writeByte(reason)
+                .writeString(message == null ? "" : message)
+                .toBytes();
+        send(player, payload);
+    }
+
+    /**
+     * Sends a policy manifest.
+     *
+     * @param player the target player
+     * @param policy the policy to encode
+     */
+    public void sendPolicy(Player player, SvtPolicy policy) {
+        SvtByteBuf buf = SvtByteBuf.writer()
+                .writeByte(SvtProtocol.S2C_POLICY_MANIFEST)
+                .writeVarInt(policy.policyVersion());
+
+        var rules = policy.rules();
+        buf.writeVarInt(rules.size());
+        for (SvtPolicyRule rule : rules) {
+            buf.writeVarInt(rule.module().ordinal());
+            buf.writeByte(rule.mode().ordinal());
+            buf.writeByte(rule.mandatory() ? 1 : 0);
+        }
+        send(player, buf.toBytes());
+    }
+
+    /**
+     * Sends an administrative notice.
+     *
+     * @param player   the target player
+     * @param severity the severity byte
+     * @param message  the message text
+     */
+    public void sendAdminMessage(Player player, byte severity, String message) {
+        byte[] payload = SvtByteBuf.writer()
+                .writeByte(SvtProtocol.S2C_ADMIN_MESSAGE)
+                .writeByte(severity)
+                .writeString(message)
+                .toBytes();
+        send(player, payload);
+    }
+
+    /**
+     * Sends an inspection request.
+     *
+     * @param player the target player
+     * @param type   the query type
+     */
+    public void sendQueryRequest(Player player, SvtQueryType type) {
+        byte[] payload = SvtByteBuf.writer()
+                .writeByte(SvtProtocol.S2C_QUERY_REQUEST)
+                .writeVarInt(type.ordinal())
+                .toBytes();
+        send(player, payload);
+    }
+
+    /**
+     * Sends a feature grant or revocation.
+     *
+     * @param player  the target player
+     * @param module  the module
+     * @param granted whether the module is granted
+     */
+    public void sendFeatureGrant(Player player, SvtModule module, boolean granted) {
+        byte[] payload = SvtByteBuf.writer()
+                .writeByte(SvtProtocol.S2C_FEATURE_GRANT)
+                .writeVarInt(module.ordinal())
+                .writeByte(granted ? 1 : 0)
+                .toBytes();
+        send(player, payload);
+    }
+
+    /**
+     * Sends a peer present announcement.
+     *
+     * @param player the target player
+     * @param peer   the peer to announce
+     */
+    public void sendPeerPresent(Player player, SvtPeer peer) {
+        byte[] payload = SvtByteBuf.writer()
+                .writeByte(SvtProtocol.S2C_PEER_PRESENT)
+                .writeUuid(peer.uuid())
+                .writeString(peer.name())
+                .writeString(peer.modVersion())
+                .writeByte(peer.capabilities())
+                .toBytes();
+        send(player, payload);
+    }
+
+    /**
+     * Sends a peer left announcement.
+     *
+     * @param player the target player
+     * @param uuid   the departed peer UUID
+     */
+    public void sendPeerLeft(Player player, UUID uuid) {
+        byte[] payload = SvtByteBuf.writer()
+                .writeByte(SvtProtocol.S2C_PEER_LEFT)
+                .writeUuid(uuid)
+                .toBytes();
+        send(player, payload);
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\net\SvtPeerRegistry.java
+```
+package synergyst.svt.plugin.net;
+
+import synergyst.svt.plugin.model.SvtPeer;
+
+import java.util.Collection;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * In memory registry of verified peers keyed by account UUID.
+ */
+public final class SvtPeerRegistry {
+
+    private final Map<UUID, SvtPeer> peers = new ConcurrentHashMap<>();
+
+    /**
+     * Stores or replaces a peer.
+     *
+     * @param peer the peer state
+     */
+    public void put(SvtPeer peer) {
+        peers.put(peer.uuid(), peer);
+    }
+
+    /**
+     * Removes a peer.
+     *
+     * @param uuid the account UUID
+     * @return the removed peer, or null
+     */
+    public SvtPeer remove(UUID uuid) {
+        return peers.remove(uuid);
+    }
+
+    /**
+     * Returns a peer by UUID.
+     *
+     * @param uuid the account UUID
+     * @return the peer, or null
+     */
+    public SvtPeer get(UUID uuid) {
+        return peers.get(uuid);
+    }
+
+    /**
+     * Returns whether the account is a verified peer.
+     *
+     * @param uuid the account UUID
+     * @return whether the peer is registered
+     */
+    public boolean contains(UUID uuid) {
+        return peers.containsKey(uuid);
+    }
+
+    /**
+     * Returns all verified peers.
+     *
+     * @return an immutable view of the peers
+     */
+    public Collection<SvtPeer> all() {
+        return Map.copyOf(peers).values();
+    }
+
+    /**
+     * Returns the number of verified peers.
+     *
+     * @return the peer count
+     */
+    public int size() {
+        return peers.size();
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\protocol\SvtByteBuf.java
+```
+package synergyst.svt.plugin.protocol;
+
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * Reader and writer for the Minecraft {@code PacketByteBuf} wire format
+ * over plain byte arrays.
+ *
+ * <p>Bukkit plugin messaging delivers a raw byte array whose content is
+ * exactly the buffer the client wrote with a {@code PacketByteBuf}. The
+ * Guava {@code ByteArrayDataInput} used by many plugins is incompatible
+ * with that format because it encodes integers and strings differently.
+ * This class implements the correct variable length integer, length
+ * prefixed string, length prefixed byte array, long, and UUID encodings
+ * so that the plugin can decode client packets and encode replies the
+ * client understands.</p>
+ *
+ * <h2>Hostile input</h2>
+ * The read side treats the source array as hostile. Every read checks
+ * bounds and throws {@link SvtDecodeException} on underflow. Length
+ * prefixed reads accept an explicit maximum and reject a declared
+ * length that exceeds it before allocating, so a malicious client
+ * cannot force an oversized allocation.
+ */
+public final class SvtByteBuf {
+
+    /**
+     * Thrown when a read fails a bounds or length check.
+     */
+    public static final class SvtDecodeException extends RuntimeException {
+        public SvtDecodeException(String message) {
+            super(message);
+        }
+    }
+
+    /* ═══════════════════ Writer ═══════════════════ */
+
+    private final ByteArrayOutputStream out;
+
+    private SvtByteBuf(ByteArrayOutputStream out) {
+        this.out = out;
+        this.data = null;
+        this.pos = 0;
+    }
+
+    /**
+     * Creates a writer backed by a growable byte buffer.
+     *
+     * @return a new writer
+     */
+    public static SvtByteBuf writer() {
+        return new SvtByteBuf(new ByteArrayOutputStream(64));
+    }
+
+    /**
+     * Writes a single byte.
+     *
+     * @param value the byte value
+     * @return this writer
+     */
+    public SvtByteBuf writeByte(int value) {
+        out.write(value & 0xFF);
+        return this;
+    }
+
+    /**
+     * Writes a variable length integer in the Minecraft encoding.
+     *
+     * @param value the value
+     * @return this writer
+     */
+    public SvtByteBuf writeVarInt(int value) {
+        while ((value & ~0x7F) != 0) {
+            out.write((value & 0x7F) | 0x80);
+            value >>>= 7;
+        }
+        out.write(value);
+        return this;
+    }
+
+    /**
+     * Writes a signed 64 bit big endian long.
+     *
+     * @param value the value
+     * @return this writer
+     */
+    public SvtByteBuf writeLong(long value) {
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            out.write((int) ((value >>> shift) & 0xFF));
+        }
+        return this;
+    }
+
+    /**
+     * Writes a length prefixed UTF-8 string.
+     *
+     * @param value the string
+     * @return this writer
+     */
+    public SvtByteBuf writeString(String value) {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        writeVarInt(bytes.length);
+        out.write(bytes, 0, bytes.length);
+        return this;
+    }
+
+    /**
+     * Writes a length prefixed byte array.
+     *
+     * @param value the bytes
+     * @return this writer
+     */
+    public SvtByteBuf writeByteArray(byte[] value) {
+        writeVarInt(value.length);
+        out.write(value, 0, value.length);
+        return this;
+    }
+
+    /**
+     * Writes a UUID as two longs, most significant first.
+     *
+     * @param uuid the UUID
+     * @return this writer
+     */
+    public SvtByteBuf writeUuid(java.util.UUID uuid) {
+        writeLong(uuid.getMostSignificantBits());
+        writeLong(uuid.getLeastSignificantBits());
+        return this;
+    }
+
+    /**
+     * Writes a long array as a var int count followed by the values,
+     * matching the client custom codec.
+     *
+     * @param values the values
+     * @return this writer
+     */
+    public SvtByteBuf writeLongArray(long[] values) {
+        writeVarInt(values.length);
+        for (long value : values) {
+            writeLong(value);
+        }
+        return this;
+    }
+
+    /**
+     * Returns the accumulated bytes.
+     *
+     * @return the written byte array
+     */
+    public byte[] toBytes() {
+        return out.toByteArray();
+    }
+
+    /* ═══════════════════ Reader ═══════════════════ */
+
+    private final byte[] data;
+    private int pos;
+
+    private SvtByteBuf(byte[] data) {
+        this.out = null;
+        this.data = data;
+        this.pos = 0;
+    }
+
+    /**
+     * Creates a reader over the given byte array.
+     *
+     * @param data the source bytes
+     * @return a new reader
+     */
+    public static SvtByteBuf reader(byte[] data) {
+        return new SvtByteBuf(data);
+    }
+
+    private void require(int count) {
+        if (pos + count > data.length) {
+            throw new SvtDecodeException("buffer underflow");
+        }
+    }
+
+    /**
+     * Reads a single byte.
+     *
+     * @return the byte value
+     */
+    public byte readByte() {
+        require(1);
+        return data[pos++];
+    }
+
+    /**
+     * Reads a variable length integer.
+     *
+     * @return the decoded value
+     */
+    public int readVarInt() {
+        int value = 0;
+        int position = 0;
+        byte b;
+        do {
+            require(1);
+            b = data[pos++];
+            value |= (b & 0x7F) << position;
+            position += 7;
+            if (position >= 35) {
+                throw new SvtDecodeException("var int too long");
+            }
+        } while ((b & 0x80) != 0);
+        return value;
+    }
+
+    /**
+     * Reads a signed 64 bit big endian long.
+     *
+     * @return the value
+     */
+    public long readLong() {
+        require(8);
+        long value = 0;
+        for (int i = 0; i < 8; i++) {
+            value = (value << 8) | (data[pos++] & 0xFFL);
+        }
+        return value;
+    }
+
+    /**
+     * Reads a length prefixed UTF-8 string, rejecting a declared
+     * length beyond the given maximum.
+     *
+     * @param maxLen the maximum byte length
+     * @return the decoded string
+     */
+    public String readString(int maxLen) {
+        int len = readVarInt();
+        if (len < 0 || len > maxLen) {
+            throw new SvtDecodeException("string length " + len + " exceeds " + maxLen);
+        }
+        require(len);
+        String value = new String(data, pos, len, StandardCharsets.UTF_8);
+        pos += len;
+        return value;
+    }
+
+    /**
+     * Reads a length prefixed byte array, rejecting a declared length
+     * beyond the given maximum.
+     *
+     * @param maxLen the maximum length
+     * @return the decoded bytes
+     */
+    public byte[] readByteArray(int maxLen) {
+        int len = readVarInt();
+        if (len < 0 || len > maxLen) {
+            throw new SvtDecodeException("array length " + len + " exceeds " + maxLen);
+        }
+        require(len);
+        byte[] value = new byte[len];
+        System.arraycopy(data, pos, value, 0, len);
+        pos += len;
+        return value;
+    }
+
+    /**
+     * Reads a UUID written as two longs.
+     *
+     * @return the UUID
+     */
+    public java.util.UUID readUuid() {
+        long most = readLong();
+        long least = readLong();
+        return new java.util.UUID(most, least);
+    }
+
+    /**
+     * Reads a long array written by the client custom codec, rejecting
+     * a declared count beyond the given maximum.
+     *
+     * @param maxWords the maximum element count
+     * @return the decoded array
+     */
+    public long[] readLongArray(int maxWords) {
+        int count = readVarInt();
+        if (count < 0 || count > maxWords) {
+            throw new SvtDecodeException("long array count " + count + " exceeds " + maxWords);
+        }
+        long[] values = new long[count];
+        for (int i = 0; i < count; i++) {
+            values[i] = readLong();
+        }
+        return values;
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\protocol\SvtProtocol.java
+```
+package synergyst.svt.plugin.protocol;
+
+/**
+ * Wire protocol constants for the Skill Verification Token channel.
+ *
+ * <p>This class mirrors the client side protocol definition. The
+ * numeric packet identifiers, reason codes, severities, statuses, and
+ * length limits must match the client exactly. Any change here without
+ * a corresponding client change breaks interoperability.</p>
+ *
+ * <h2>Transport</h2>
+ * Traffic travels on the plugin message channel identified by
+ * {@link #CHANNEL}. The server registers this channel on enable. A
+ * client that does not advertise the channel receives nothing.
+ *
+ * <h2>Encoding</h2>
+ * Packet bodies use the Minecraft {@code PacketByteBuf} encoding, not
+ * the Bukkit or Guava data stream format. Variable length integers,
+ * length prefixed strings, and length prefixed byte arrays follow the
+ * conventions implemented in {@link SvtByteBuf}.
+ */
+public final class SvtProtocol {
+
+    /** Protocol revision this plugin speaks. */
+    public static final int VERSION = 3;
+
+    /** Plugin message channel in namespace:path form. */
+    public static final String CHANNEL = "synergystcrystal:svt";
+
+    /* ═══════════════════ Client to server ids ═══════════════════ */
+
+    public static final byte C2S_HELLO = 0x01;
+    public static final byte C2S_HANDSHAKE = 0x02;
+    public static final byte C2S_POLICY_ACK = 0x03;
+    public static final byte C2S_QUERY_RESPONSE = 0x04;
+
+    /* ═══════════════════ Server to client ids ═══════════════════ */
+
+    public static final byte S2C_SERVER_CHALLENGE = 0x01;
+    public static final byte S2C_PROTOCOL_REJECT = 0x02;
+    public static final byte S2C_PEER_PRESENT = 0x03;
+    public static final byte S2C_PEER_LEFT = 0x04;
+    public static final byte S2C_PEER_STATS = 0x05;
+    public static final byte S2C_PEER_COMBAT = 0x06;
+    public static final byte S2C_POLICY_MANIFEST = 0x07;
+    public static final byte S2C_ADMIN_MESSAGE = 0x08;
+    public static final byte S2C_QUERY_REQUEST = 0x09;
+    public static final byte S2C_FEATURE_GRANT = 0x0A;
+
+    /* ═══════════════════ Reject reason codes ═══════════════════ */
+
+    public static final byte REJECT_UNKNOWN = 0;
+    public static final byte REJECT_SIGNATURE = 1;
+    public static final byte REJECT_OUTDATED = 2;
+    public static final byte REJECT_BLOCKED = 3;
+    public static final byte REJECT_POLICY = 4;
+    public static final byte REJECT_MALFORMED = 5;
+
+    /* ═══════════════════ Admin message severity ═══════════════════ */
+
+    public static final byte SEVERITY_INFO = 0;
+    public static final byte SEVERITY_WARN = 1;
+    public static final byte SEVERITY_ERROR = 2;
+
+    /* ═══════════════════ Query response status ═══════════════════ */
+
+    public static final byte QUERY_OK = 0;
+    public static final byte QUERY_DENIED = 1;
+    public static final byte QUERY_UNSUPPORTED = 2;
+
+    /* ═══════════════════ Capability bit field ═══════════════════ */
+
+    public static final byte CAP_HANDSHAKE_ONLY = 1 << 0;
+    public static final byte CAP_STATS_VISIBLE = 1 << 1;
+    public static final byte CAP_COMBAT_VISIBLE = 1 << 2;
+    public static final byte CAP_NAMEPLATE_VISIBLE = 1 << 3;
+
+    /* ═══════════════════ Length limits ═══════════════════ */
+
+    public static final int MAX_VERSION_LEN = 32;
+    public static final int MAX_NAME_LEN = 64;
+    public static final int MAX_CONFIG_HASH_LEN = 128;
+    public static final int MAX_CHALLENGE_NONCE_LEN = 64;
+    public static final int MAX_REJECT_MSG_LEN = 256;
+    public static final int MAX_ADMIN_MSG_LEN = 512;
+    public static final int MAX_STATS_BLOB_LEN = 16384;
+    public static final int MAX_PUBLIC_KEY_LEN = 256;
+    public static final int MAX_SIGNATURE_LEN = 128;
+    public static final int MAX_MANIFEST_WORDS = 8;
+    public static final int MAX_POLICY_RULES = 128;
+    public static final int MAX_QUERY_STRING_LEN = 256;
+
+    /** Nonce length the server issues in a challenge. */
+    public static final int CHALLENGE_NONCE_LEN = 16;
+
+    private SvtProtocol() {
+        throw new AssertionError("Constants holder");
+    }
+
+    /**
+     * Returns a human readable name for a reject reason code.
+     *
+     * @param code the reason code
+     * @return the reason name
+     */
+    public static String rejectReasonName(byte code) {
+        return switch (code) {
+            case REJECT_SIGNATURE -> "SIGNATURE_INVALID";
+            case REJECT_OUTDATED  -> "MOD_OUTDATED";
+            case REJECT_BLOCKED   -> "KEY_BLOCKED";
+            case REJECT_POLICY    -> "POLICY_VIOLATION";
+            case REJECT_MALFORMED -> "MALFORMED_PAYLOAD";
+            default               -> "UNKNOWN";
+        };
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\store\SvtAuditLog.java
+```
+package synergyst.svt.plugin.store;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.logging.Logger;
+
+/**
+ * Append only audit log of handshake verdicts in JSON lines format.
+ *
+ * <p>Each verified or rejected handshake produces one line. The format
+ * is suitable for ingestion by an external log processor or dashboard.
+ * Writes are synchronized so concurrent handshakes do not interleave
+ * within a line.</p>
+ */
+public final class SvtAuditLog {
+
+    private static final Gson GSON = new Gson();
+
+    private final Path file;
+    private final Logger logger;
+    private final Object lock = new Object();
+
+    /**
+     * Creates an audit log bound to a file path.
+     *
+     * @param file   the audit file path
+     * @param logger the plugin logger
+     */
+    public SvtAuditLog(Path file, Logger logger) {
+        this.file = file;
+        this.logger = logger;
+    }
+
+    /**
+     * Writes one audit entry.
+     *
+     * @param uuid            the account UUID
+     * @param name            the account name
+     * @param keyFingerprint  the short key fingerprint
+     * @param modVersion      the reported mod version
+     * @param protocolVersion the reported protocol version
+     * @param moduleCount     the number of active modules
+     * @param configHash      the reported config hash
+     * @param verdict         the handshake verdict text
+     */
+    public void record(String uuid, String name, String keyFingerprint,
+                       String modVersion, int protocolVersion,
+                       int moduleCount, String configHash, String verdict) {
+        JsonObject obj = new JsonObject();
+        obj.addProperty("ts", System.currentTimeMillis());
+        obj.addProperty("uuid", uuid);
+        obj.addProperty("name", name);
+        obj.addProperty("keyFingerprint", keyFingerprint);
+        obj.addProperty("modVersion", modVersion);
+        obj.addProperty("protocolVersion", protocolVersion);
+        obj.addProperty("moduleCount", moduleCount);
+        obj.addProperty("configHash", configHash);
+        obj.addProperty("verdict", verdict);
+
+        String line = GSON.toJson(obj) + "\n";
+        synchronized (lock) {
+            try {
+                Files.createDirectories(file.getParent());
+                Files.writeString(file, line, StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            } catch (IOException e) {
+                logger.warning("Failed to write audit entry: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Reads the last n lines of the audit log.
+     *
+     * @param n the maximum number of lines
+     * @return the tail lines, oldest first, or an empty list on failure
+     */
+    public java.util.List<String> tail(int n) {
+        try {
+            if (!Files.exists(file)) {
+                return java.util.List.of();
+            }
+            java.util.List<String> all = Files.readAllLines(file, StandardCharsets.UTF_8);
+            int from = Math.max(0, all.size() - n);
+            return all.subList(from, all.size());
+        } catch (IOException e) {
+            return java.util.List.of();
+        }
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\store\SvtBlocklist.java
+```
+package synergyst.svt.plugin.store;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
+
+/**
+ * Persistent set of revoked public key hashes.
+ *
+ * <p>A blocked entry is the full SHA-256 hash of a client public key.
+ * Blocking a key rejects any client presenting that identity regardless
+ * of the account it uses, so a name change does not evade the block. A
+ * blocked user must generate a new identity to reconnect, and that new
+ * identity can be caught again through behavioural corroboration.</p>
+ *
+ * <h2>Storage</h2>
+ * One key hash per line in a plain text file. Blank lines and lines
+ * beginning with a hash sign are ignored.
+ */
+public final class SvtBlocklist {
+
+    private final Path file;
+    private final Logger logger;
+    private final Set<String> blocked = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Creates a blocklist bound to a file path.
+     *
+     * @param file   the blocklist file path
+     * @param logger the plugin logger
+     */
+    public SvtBlocklist(Path file, Logger logger) {
+        this.file = file;
+        this.logger = logger;
+    }
+
+    /**
+     * Loads the blocklist from disk, creating an empty file if none
+     * exists.
+     */
+    public void load() {
+        try {
+            if (!Files.exists(file)) {
+                Files.createDirectories(file.getParent());
+                Files.writeString(file, "# One public key hash per line\n",
+                        StandardCharsets.UTF_8);
+            }
+            blocked.clear();
+            for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+                String trimmed = line.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+                    continue;
+                }
+                blocked.add(trimmed.toLowerCase());
+            }
+            logger.info("Loaded " + blocked.size() + " SVT blocklist entries");
+        } catch (Exception e) {
+            logger.severe("Failed to load SVT blocklist: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Tests whether a key hash is blocked.
+     *
+     * @param keyHash the full key hash
+     * @return whether the hash is on the blocklist
+     */
+    public boolean isBlocked(String keyHash) {
+        return keyHash != null && blocked.contains(keyHash.toLowerCase());
+    }
+
+    /**
+     * Adds a key hash to the blocklist and appends it to the file.
+     *
+     * @param keyHash the full key hash
+     * @return whether the hash was newly added
+     */
+    public boolean add(String keyHash) {
+        if (keyHash == null) {
+            return false;
+        }
+        String normalized = keyHash.toLowerCase();
+        if (!blocked.add(normalized)) {
+            return false;
+        }
+        try {
+            Files.writeString(file, normalized + "\n", StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            logger.warning("Failed to persist blocklist entry: " + e.getMessage());
+        }
+        return true;
+    }
+
+    /**
+     * Removes a key hash from the blocklist and rewrites the file.
+     *
+     * @param keyHash the full key hash
+     * @return whether the hash was present and removed
+     */
+    public boolean remove(String keyHash) {
+        if (keyHash == null) {
+            return false;
+        }
+        if (!blocked.remove(keyHash.toLowerCase())) {
+            return false;
+        }
+        rewrite();
+        return true;
+    }
+
+    private void rewrite() {
+        try {
+            StringBuilder sb = new StringBuilder("# One public key hash per line\n");
+            for (String entry : blocked) {
+                sb.append(entry).append('\n');
+            }
+            Files.writeString(file, sb.toString(), StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException e) {
+            logger.warning("Failed to rewrite blocklist: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Returns the number of blocked entries.
+     *
+     * @return the block count
+     */
+    public int size() {
+        return blocked.size();
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\store\SvtPolicyStore.java
+```
+package synergyst.svt.plugin.store;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import synergyst.svt.plugin.model.SvtPolicy;
+import synergyst.svt.plugin.model.SvtModule;
+import synergyst.svt.plugin.model.SvtPolicyMode;
+import synergyst.svt.plugin.model.SvtPolicyRule;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.EnumMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.logging.Logger;
+
+/**
+ * Loads and hot reloads the server policy from a JSON file.
+ *
+ * <h2>File format</h2>
+ * <pre>{@code
+ *   {
+ *     "policyVersion": 1,
+ *     "minModVersion": "v2.1.16",
+ *     "requireConfigWhitelist": false,
+ *     "approvedConfigHashes": [],
+ *     "rules": {
+ *       "FAST_ATTACK_PLACE": { "mode": "ALLOW",  "mandatory": false },
+ *       "BOT_TRAINING":      { "mode": "FORBID", "mandatory": true }
+ *     }
+ *   }
+ * }</pre>
+ *
+ * <h2>Validation</h2>
+ * Unknown module names and unknown mode names are skipped with a
+ * warning rather than aborting the load. A missing file causes a
+ * default permissive policy to be written and used.
+ */
+public final class SvtPolicyStore {
+
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+    private final Path file;
+    private final Logger logger;
+    private volatile SvtPolicy active;
+
+    /** JSON shape of a single rule. */
+    private static final class RuleJson {
+        String mode;
+        boolean mandatory;
+    }
+
+    /** JSON shape of the policy file. */
+    private static final class PolicyJson {
+        int policyVersion = 1;
+        String minModVersion = "";
+        boolean requireConfigWhitelist = false;
+        java.util.List<String> approvedConfigHashes = new java.util.ArrayList<>();
+        Map<String, RuleJson> rules = new LinkedHashMap<>();
+    }
+
+    /**
+     * Creates a policy store bound to a file path.
+     *
+     * @param file   the policy file path
+     * @param logger the plugin logger
+     */
+    public SvtPolicyStore(Path file, Logger logger) {
+        this.file = file;
+        this.logger = logger;
+    }
+
+    /**
+     * Loads the policy from disk, writing a default file if none
+     * exists.
+     */
+    public void load() {
+        try {
+            if (!Files.exists(file)) {
+                writeDefault();
+            }
+            String json = Files.readString(file, StandardCharsets.UTF_8);
+            PolicyJson parsed = GSON.fromJson(json, PolicyJson.class);
+            if (parsed == null) {
+                parsed = new PolicyJson();
+            }
+            active = build(parsed);
+            logger.info("Loaded SVT policy v" + active.policyVersion()
+                    + " with " + active.enforcingCount() + " enforcing rules");
+        } catch (Exception e) {
+            logger.severe("Failed to load SVT policy: " + e.getMessage());
+            active = build(new PolicyJson());
+        }
+    }
+
+    private SvtPolicy build(PolicyJson json) {
+        Map<SvtModule, SvtPolicyRule> rules = new EnumMap<>(SvtModule.class);
+        for (Map.Entry<String, RuleJson> entry : json.rules.entrySet()) {
+            SvtModule module = SvtModule.byName(entry.getKey());
+            if (module == null) {
+                logger.warning("Unknown module in policy: " + entry.getKey());
+                continue;
+            }
+            RuleJson ruleJson = entry.getValue();
+            SvtPolicyMode mode = SvtPolicyMode.byName(ruleJson.mode);
+            if (mode == null) {
+                logger.warning("Unknown mode for " + entry.getKey() + ": " + ruleJson.mode);
+                continue;
+            }
+            rules.put(module, new SvtPolicyRule(module, mode, ruleJson.mandatory));
+        }
+        return new SvtPolicy(
+                json.policyVersion,
+                json.minModVersion == null ? "" : json.minModVersion,
+                rules,
+                json.requireConfigWhitelist,
+                Set.copyOf(json.approvedConfigHashes));
+    }
+
+    private void writeDefault() throws IOException {
+        PolicyJson def = new PolicyJson();
+        def.policyVersion = 1;
+        def.minModVersion = "";
+        RuleJson botRule = new RuleJson();
+        botRule.mode = SvtPolicyMode.FORBID.name();
+        botRule.mandatory = true;
+        def.rules.put(SvtModule.BOT_TRAINING.name(), botRule);
+        Files.createDirectories(file.getParent());
+        Files.writeString(file, GSON.toJson(def), StandardCharsets.UTF_8);
+        logger.info("Wrote default SVT policy to " + file);
+    }
+
+    /**
+     * Returns the active policy.
+     *
+     * @return the current policy
+     */
+    public SvtPolicy policy() {
+        return active;
+    }
+}
+```
+
+
+main\java\synergyst\svt\plugin\SvtPlugin.java
+```
+package synergyst.svt.plugin;
+
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.plugin.java.JavaPlugin;
+import synergyst.svt.plugin.command.SvtCommand;
+import synergyst.svt.plugin.model.SvtPeer;
+import synergyst.svt.plugin.net.SvtChallengeManager;
+import synergyst.svt.plugin.net.SvtChannelListener;
+import synergyst.svt.plugin.net.SvtMessenger;
+import synergyst.svt.plugin.net.SvtPeerRegistry;
+import synergyst.svt.plugin.protocol.SvtProtocol;
+import synergyst.svt.plugin.store.SvtAuditLog;
+import synergyst.svt.plugin.store.SvtBlocklist;
+import synergyst.svt.plugin.store.SvtPolicyStore;
+
+import java.nio.file.Path;
+
+/**
+ * Main plugin entry point for the server side Skill Verification Token
+ * subsystem.
+ *
+ * <h2>Responsibilities on enable</h2>
+ * <ul>
+ *   <li>Load the policy, blocklist, and prepare the audit log.</li>
+ *   <li>Register the plugin message channel for inbound and outbound
+ *       traffic.</li>
+ *   <li>Register the administration command and the quit listener.</li>
+ * </ul>
+ *
+ * <h2>Client interaction</h2>
+ * The client mod initiates the handshake. This plugin responds to
+ * presence announcements with challenges, verifies handshakes, applies
+ * policy, relays peer presence, and answers administrator driven
+ * inspection. No behaviour is initiated by the plugin toward a client
+ * that has not first announced itself.
+ */
+public final class SvtPlugin extends JavaPlugin implements Listener {
+
+    private SvtMessenger messenger;
+    private SvtPeerRegistry registry;
+    private SvtChallengeManager challenges;
+    private SvtPolicyStore policyStore;
+    private SvtBlocklist blocklist;
+    private SvtAuditLog audit;
+    private SvtChannelListener listener;
+
+    @Override
+    public void onEnable() {
+        Path dir = getDataFolder().toPath();
+
+        this.policyStore = new SvtPolicyStore(dir.resolve("policy.json"), getLogger());
+        this.blocklist = new SvtBlocklist(dir.resolve("blocklist.txt"), getLogger());
+        this.audit = new SvtAuditLog(dir.resolve("audit.jsonl"), getLogger());
+        this.registry = new SvtPeerRegistry();
+        this.challenges = new SvtChallengeManager();
+        this.messenger = new SvtMessenger(this);
+
+        policyStore.load();
+        blocklist.load();
+
+        this.listener = new SvtChannelListener(this);
+        getServer().getMessenger().registerOutgoingPluginChannel(this, SvtProtocol.CHANNEL);
+        getServer().getMessenger().registerIncomingPluginChannel(this, SvtProtocol.CHANNEL, listener);
+
+        var command = new SvtCommand(this);
+        getCommand("svt").setExecutor(command);
+        getCommand("svt").setTabCompleter(command);
+
+        getServer().getPluginManager().registerEvents(this, this);
+
+        getLogger().info("SVT server plugin enabled, protocol v" + SvtProtocol.VERSION);
+    }
+
+    @Override
+    public void onDisable() {
+        getServer().getMessenger().unregisterOutgoingPluginChannel(this);
+        getServer().getMessenger().unregisterIncomingPluginChannel(this);
+        getLogger().info("SVT server plugin disabled");
+    }
+
+    /**
+     * Removes a departing player from the registry and broadcasts a
+     * peer left announcement to the remaining verified peers.
+     *
+     * @param event the quit event
+     */
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        var uuid = event.getPlayer().getUniqueId();
+        challenges.clear(uuid);
+        SvtPeer removed = registry.remove(uuid);
+        if (removed == null || removed.isHandshakeOnly()) {
+            return;
+        }
+        for (SvtPeer other : registry.all()) {
+            org.bukkit.entity.Player otherPlayer =
+                    getServer().getPlayer(other.uuid());
+            if (otherPlayer != null) {
+                messenger.sendPeerLeft(otherPlayer, uuid);
+            }
+        }
+    }
+
+    /* ═══════════════════ Accessors ═══════════════════ */
+
+    public SvtMessenger messenger() {
+        return messenger;
+    }
+
+    public SvtPeerRegistry registry() {
+        return registry;
+    }
+
+    public SvtChallengeManager challenges() {
+        return challenges;
+    }
+
+    public SvtPolicyStore policyStore() {
+        return policyStore;
+    }
+
+    public SvtBlocklist blocklist() {
+        return blocklist;
+    }
+
+    public SvtAuditLog audit() {
+        return audit;
+    }
+
+    public SvtChannelListener listener() {
+        return listener;
+    }
+}
+```
+
+
+main\resources\plugin.yml
+```
+name: SynergystSvt
+version: 1.0.0
+main: synergyst.svt.plugin.SvtPlugin
+api-version: '1.20'
+author: Synergyst
+description: Server side Skill Verification Token handshake, policy enforcement, and inspection.
+commands:
+  svt:
+    description: Skill Verification Token administration.
+    permission: svt.admin
+    usage: /svt <list|inspect|query|grant|block|unblock|kick|msg|policy|audit>
+permissions:
+  svt.admin:
+    description: Full access to SVT administration commands.
+    default: op
+```
+
+
